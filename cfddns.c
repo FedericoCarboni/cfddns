@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <stdint.h>
 #include <string.h>
@@ -56,73 +57,44 @@ static const uint32_t OPENDNS_SERVERS[4] = {
     0xD043DEDC, // 208.67.222.220 resolver3.opendns.com
     0xD043DCDE, // 208.67.220.222 resolver4.opendns.com
 };
-unsigned char *ReadName(unsigned char *, unsigned char *, int *);
 
-#define T_A 1     // Ipv4 address
-#define T_NS 2    // Nameserver
-#define T_CNAME 5 // canonical name
-#define T_SOA 6   /* start of authority zone */
-#define T_PTR 12  /* domain name pointer */
-#define T_MX 15   // Mail server
+static unsigned int opendns_index = 0;
 
-// DNS header structure
-struct DNS_HEADER
-{
-    unsigned short id; // identification number
+static struct sockaddr_in dns_sockaddr;
+static int socket_fd;
 
-    unsigned char rd : 1;     // recursion desired
-    unsigned char tc : 1;     // truncated message
-    unsigned char aa : 1;     // authoritive answer
-    unsigned char opcode : 4; // purpose of message
-    unsigned char qr : 1;     // query/response flag
+static void read_dns_name(uint8_t *name, uint8_t *buf, uint8_t *resp, int *count) {
+    unsigned int p = 0, jumped = 0, offset;
+    int i, j;
 
-    unsigned char rcode : 4; // response code
-    unsigned char cd : 1;    // checking disabled
-    unsigned char ad : 1;    // authenticated data
-    unsigned char z : 1;     // its z! reserved
-    unsigned char ra : 1;    // recursion available
+    *count = 1;
+    name[0] = '\0';
 
-    unsigned short qdcount; // number of question entries
-    unsigned short ancount; // number of answer entries
-    unsigned short nscount; // number of authority entries
-    unsigned short arcount; // number of resource entries
-};
+    // read the names in 3www6google3com format
+    while (*buf != 0) {
+        if (*buf >= 192) {
+            offset = (*buf) * 256 + *(buf + 1) - 49152; // 49152 = 11000000 00000000 ;)
+            buf = resp + offset - 1;
+            jumped = 1; // we have jumped to another location so counting wont go up!
+        } else {
+            name[p++] = *buf;
+        }
 
-// Constant sized fields of query structure
-struct QUESTION
-{
-    unsigned short qtype;
-    unsigned short qclass;
-};
+        buf = buf + 1;
 
-// Constant sized fields of the resource record structure
-#pragma pack(push, 1)
-struct R_DATA
-{
-    unsigned short type;
-    unsigned short _class;
-    unsigned int ttl;
-    unsigned short data_len;
-};
-#pragma pack(pop)
+        if (jumped == 0) {
+            *count = *count + 1; // if we havent jumped to another location then we can count up
+        }
+    }
 
-// Pointers to resource record contents
-struct RES_RECORD
-{
-    unsigned char *name;
-    struct R_DATA *resource;
-    unsigned char *rdata;
-};
-
-// Structure of a Query
-typedef struct
-{
-    unsigned char *name;
-    struct QUESTION *ques;
-} QUERY;
+    name[p] = '\0'; // string complete
+    if (jumped == 1) {
+        *count = *count + 1; // number of steps we actually moved forward in the packet
+    }
+}
 
 
-static int resolve_current_ip(uint32_t dns_server_ip) {
+static int try_find_ip(struct in_addr *addr) {
     uint16_t id = (uint16_t)(pcg32_random() & 0xffffU);
     uint16_t packet[17];
     packet[0] = htons(id);
@@ -137,221 +109,81 @@ static int resolve_current_ip(uint32_t dns_server_ip) {
     packet[16] = htons(1);     // QCLASS
 
     // Get OpenDNS socket address
-    struct sockaddr_in dns_sockaddr;
-    dns_sockaddr.sin_family = AF_INET;
-    dns_sockaddr.sin_port = htons(53);
-    dns_sockaddr.sin_addr.s_addr = htonl(dns_server_ip);
+    // struct sockaddr_in dns_sockaddr;
+    // dns_sockaddr.sin_family = AF_INET;
+    // dns_sockaddr.sin_port = htons(53);
+    // dns_sockaddr.sin_addr.s_addr = htonl(dns_server_ip);
 
-    int socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    ssize_t ret = sendto(socket_fd, packet, sizeof(packet), 0,
-                         &dns_sockaddr, sizeof(dns_sockaddr));
+    // Open a socket
+    // int socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ssize_t ret;
+
+    ret = sendto(socket_fd, packet, sizeof(packet), 0,
+                 &dns_sockaddr, sizeof(dns_sockaddr));
     if (ret < 0)
         return ret;
     
-    uint8_t buffer[1 << 16];
-    unsigned int x = sizeof(dns_sockaddr);
-    ret = recvfrom(socket_fd, buffer, sizeof(buffer), 0,
-                   &dns_sockaddr, &x);
-    if (ret < 0)
-        return ret;
-    
-    char *reader;
-    struct DNS_HEADER *dns = NULL;
-    struct QUESTION *qinfo = NULL;
+    uint8_t resp[1 << 12];
 
-    struct RES_RECORD answers[20], auth[20], addit[20]; // the replies from the DNS server
+    unsigned int socket_address_size = sizeof(dns_sockaddr);
+    unsigned int retries = 16;
+    do {
+        ret = recvfrom(socket_fd, resp, sizeof(resp), 0,
+                       &dns_sockaddr, &socket_address_size);
+        if (ret < 0)
+            return ret;
+        if (--retries == 0)
+            break;
+    } while (ret < sizeof(packet) || ntohs(((uint16_t *)resp)[0]) != id);
 
-    dns = (struct DNS_HEADER *)buffer;
+    uint16_t ancount = ntohs(((uint16_t *)resp)[3]);
+    uint8_t name[256];
 
-    // move ahead of the dns header and the query field
-    reader = &buffer[sizeof(struct DNS_HEADER) + 18 + sizeof(struct QUESTION)];
-    struct sockaddr_in a;
+    uint8_t *buf = resp + sizeof(packet);
 
-    printf("\nThe response contains : ");
-    printf("\n %d Questions.", ntohs(dns->qdcount));
-    printf("\n %d Answers.", ntohs(dns->ancount));
-    printf("\n %d Authoritative Servers.", ntohs(dns->nscount));
-    printf("\n %d Additional records.\n\n", ntohs(dns->arcount));
+    int count = 0;
 
-    // Start reading answers
-    int stop = 0;
-    int i, j, s;
+    read_dns_name(name, buf, resp, &count);
 
-    for (i = 0; i < ntohs(dns->ancount); i++)
-    {
-        answers[i].name = ReadName(reader, buffer, &stop);
-        reader = reader + stop;
+    buf += count;
 
-        answers[i].resource = (struct R_DATA *)(reader);
-        reader = reader + sizeof(struct R_DATA);
-
-        if (ntohs(answers[i].resource->type) == 1) // if its an ipv4 address
-        {
-            answers[i].rdata = (unsigned char *)malloc(ntohs(answers[i].resource->data_len));
-
-            for (j = 0; j < ntohs(answers[i].resource->data_len); j++)
-            {
-                answers[i].rdata[j] = reader[j];
-            }
-
-            answers[i].rdata[ntohs(answers[i].resource->data_len)] = '\0';
-
-            reader = reader + ntohs(answers[i].resource->data_len);
-        }
-        else
-        {
-            answers[i].rdata = ReadName(reader, buffer, &stop);
-            reader = reader + stop;
-        }
+    if (!memcmp("\4myip\7opendns\3com\0", name, 18) && ntohs(((uint16_t *)buf)[0]) == 1) {
+        addr->s_addr = htonl((buf[10] << 24) | (buf[11] << 16) | (buf[12] << 8) | buf[13]);
+        return 0;
     }
 
-    // read authorities
-    for (i = 0; i < ntohs(dns->nscount); i++)
-    {
-        auth[i].name = ReadName(reader, buffer, &stop);
-        reader += stop;
-
-        auth[i].resource = (struct R_DATA *)(reader);
-        reader += sizeof(struct R_DATA);
-
-        auth[i].rdata = ReadName(reader, buffer, &stop);
-        reader += stop;
-    }
-
-    // read additional
-    for (i = 0; i < ntohs(dns->arcount); i++)
-    {
-        addit[i].name = ReadName(reader, buffer, &stop);
-        reader += stop;
-
-        addit[i].resource = (struct R_DATA *)(reader);
-        reader += sizeof(struct R_DATA);
-
-        if (ntohs(addit[i].resource->type) == 1)
-        {
-            addit[i].rdata = (unsigned char *)malloc(ntohs(addit[i].resource->data_len));
-            for (j = 0; j < ntohs(addit[i].resource->data_len); j++)
-                addit[i].rdata[j] = reader[j];
-
-            addit[i].rdata[ntohs(addit[i].resource->data_len)] = '\0';
-            reader += ntohs(addit[i].resource->data_len);
-        }
-        else
-        {
-            addit[i].rdata = ReadName(reader, buffer, &stop);
-            reader += stop;
-        }
-    }
-
-    // print answers
-    printf("\nAnswer Records : %d \n", ntohs(dns->ancount));
-    for (i = 0; i < ntohs(dns->ancount); i++)
-    {
-        printf("Name : %s ", answers[i].name);
-
-        if (ntohs(answers[i].resource->type) == T_A) // IPv4 address
-        {
-            long *p;
-            p = (long *)answers[i].rdata;
-            a.sin_addr.s_addr = (*p); // working without ntohl
-            printf("has IPv4 address : %s", inet_ntoa(a.sin_addr));
-        }
-
-        if (ntohs(answers[i].resource->type) == 5)
-        {
-            // Canonical name for an alias
-            printf("has alias name : %s", answers[i].rdata);
-        }
-
-        printf("\n");
-    }
-
-    // print authorities
-    printf("\nAuthoritive Records : %d \n", ntohs(dns->nscount));
-    for (i = 0; i < ntohs(dns->nscount); i++)
-    {
-
-        printf("Name : %s ", auth[i].name);
-        if (ntohs(auth[i].resource->type) == 2)
-        {
-            printf("has nameserver : %s", auth[i].rdata);
-        }
-        printf("\n");
-    }
-
-    // print additional resource records
-    printf("\nAdditional Records : %d \n", ntohs(dns->arcount));
-    for (i = 0; i < ntohs(dns->arcount); i++)
-    {
-        printf("Name : %s ", addit[i].name);
-        if (ntohs(addit[i].resource->type) == 1)
-        {
-            long *p;
-            p = (long *)addit[i].rdata;
-            a.sin_addr.s_addr = (*p);
-            printf("has IPv4 address : %s", inet_ntoa(a.sin_addr));
-        }
-        printf("\n");
-    }
-    return;
-
+    return -1;
 }
 
-unsigned char *ReadName(unsigned char *reader, unsigned char *buffer, int *count)
-{
-    unsigned char *name;
-    unsigned int p = 0, jumped = 0, offset;
-    int i, j;
+static int network_init(void) {
+    dns_sockaddr.sin_family = AF_INET;
+    dns_sockaddr.sin_port = htons(53);
+    dns_sockaddr.sin_addr.s_addr = htonl(OPENDNS_SERVERS[0]);
 
-    *count = 1;
-    name = (unsigned char *)malloc(256);
-
-    name[0] = '\0';
-
-    // read the names in 3www6google3com format
-    while (*reader != 0)
-    {
-        if (*reader >= 192)
-        {
-            offset = (*reader) * 256 + *(reader + 1) - 49152; // 49152 = 11000000 00000000 ;)
-            reader = buffer + offset - 1;
-            jumped = 1; // we have jumped to another location so counting wont go up!
-        }
-        else
-        {
-            name[p++] = *reader;
-        }
-
-        reader = reader + 1;
-
-        if (jumped == 0)
-        {
-            *count = *count + 1; // if we havent jumped to another location then we can count up
-        }
-    }
-
-    name[p] = '\0'; // string complete
-    if (jumped == 1)
-    {
-        *count = *count + 1; // number of steps we actually moved forward in the packet
-    }
-
-    // now convert 3www6google3com0 to www.google.com
-    for (i = 0; i < (int)strlen((const char *)name); i++)
-    {
-        p = name[i];
-        for (j = 0; j < (int)p; j++)
-        {
-            name[i] = name[i + 1];
-            i = i + 1;
-        }
-        name[i] = '.';
-    }
-    name[i - 1] = '\0'; // remove the last dot
-    return name;
+    socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0)
+        return socket_fd;
+    int ret;
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 50000;
+    ret = setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (ret < 0)
+        return ret;
+    return 0;
 }
 
 int main(void) {
     pcg32_random_init();
-    printf("%s\n", strerror(resolve_current_ip(OPENDNS_SERVERS[0])));
+    int ret = network_init();
+    if (ret < 0)
+        goto error;
+    struct in_addr addr;
+    ret = try_find_ip(&addr);
+    if (ret < 0)
+        goto error;
+    return 0;
+error:
+    printf("%s\n", strerror(ret));
+    return -ret;
 }
