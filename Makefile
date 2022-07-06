@@ -4,7 +4,7 @@ CC=cc
 LIBS=-lcurl
 ARCH=linux
 
-PREFIX=.
+PREFIX=/usr/local
 BINDIR=${PREFIX}/bin
 
 ${TARGET}: Makefile ${TARGET}.c 
