@@ -27,7 +27,7 @@
 #define log_debug(args...)
 #endif
 
-#define CONFIG_FILENAME PREFIX "/etc/cfddns.conf"
+#define CONFIG_FILENAME "cfddns.conf"
 
 struct pcg32_random_ctx {
     uint64_t state;
@@ -317,21 +317,20 @@ static void deinit(void) {
 
     log_debug("Closing open sockets");
     close(socket_fd);
+    curl_global_cleanup();
     closelog();
 }
 
 static int parse_config(void) {
     // Open config in readonly mode
     FILE *config = fopen(CONFIG_FILENAME, "r");
+    if (config == NULL)
+        return -1;
     struct cfg_dns_zone *zone;
     char key[255];
     char value[255];
     int ret = 0;
     while (1) {
-        // ret = fscanf(config, "# %*[^\n]s");
-        // if (ret < 0) {
-        //     break;
-        // }
         ret = fscanf(config, "\n%[^=]254s", key);
         if (ret < 0) {
             break;
@@ -340,7 +339,6 @@ static int parse_config(void) {
         if (ret < 0) {
             break;
         }
-        // printf("%s and %s\n", key, value);
         if (!strcmp("cf_token", key)) {
             if (cfg_cf_token != NULL) {
                 printf("Duplicate key cf_token in configuration file");
@@ -398,6 +396,8 @@ static void init(void) {
         struct passwd *nobody = getpwnam("nobody");
         if (nobody == NULL || setgid(nobody->pw_gid) < 0 || setuid(nobody->pw_uid) < 0) {
             syslog(LOG_ERR, "Unable to set user to nobody.");
+            deinit();
+            exit(1);
         }
     }
 
@@ -412,7 +412,11 @@ static void init(void) {
     }
     
     // Init curl
-    curl_global_init(0);
+    if (curl_global_init(0) != CURLE_OK) {
+        syslog(LOG_ERR, "Could not initialize cURL: %s.", curl_easy_strerror(ret));
+        deinit();
+        exit(1);
+    }
 
     log_debug("Initialization successful.");
 }
