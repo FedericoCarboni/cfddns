@@ -1,2 +1,11 @@
 [Unit]
-Description=
+Description=Cloudflare Dynamic DNS Update Daemon
+Requires=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/cfddns
+Restart=always
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
