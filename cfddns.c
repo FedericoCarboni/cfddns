@@ -98,12 +98,6 @@ static char *cfg_cf_token = NULL;
  * How frequently we should check for IP address changes in seconds.
  */
 static unsigned int cfg_interval = 40;
-/*
- * How frequently we should synchronize with Cloudflare's DNS server to check
- * that it has the correct IP address, in seconds.
- * The real interval will be roughly sync_interval + interval
- */
-static unsigned int cfg_sync_interval = 3600 * 4;
 
 /*
  * A DNS zone with entries that need to be updated.
@@ -279,6 +273,7 @@ static int try_update_check(void) {
         }
       }
     }
+    printf("IP address updated to %s\n", inet_ntoa(addr));
     is_dirty = false;
   } else {
     log_debug("IP address didn't change.");
@@ -335,11 +330,23 @@ static void deinit(void) {
   closelog();
 }
 
+static void print_config_file_help(void) {
+  printf(
+    "Invalid or missing config file, please edit " CONFIG_FILENAME " to include a valid cf_token, zone_id and id.\n\n"
+    "The config file consists of key=value pairs, empty lines are ignored.\n"
+    "  'cf_token' is required and must be set to a valid Cloudflare API token.\n"
+    "  'interval' specifies how frequently the daemon should check for IP changes, in seconds. Defaults to 40.\n"
+    "  'zone_id' sets the id of the Cloudflare DNS zone to update, it must precede any id key. It can be repeated multiple times to update multiple DNS zones.\n"
+    "  'id' sets the id of the Cloudflare DNS record to update. It can be repeated multiple times to update multiple DNS records.\n"
+  );
+}
+
 static int parse_config(void) {
   // Open config in readonly mode
   FILE *config = fopen(CONFIG_FILENAME, "r");
-  if (config == NULL)
+  if (config == NULL) {
     return -1;
+  }
   struct cfg_dns_zone *zone;
   char key[255];
   char value[255];
@@ -361,8 +368,6 @@ static int parse_config(void) {
       cfg_cf_token = strdup(value);
     } else if (!strcmp("interval", key)) {
       cfg_interval = (unsigned int)atol(value);
-    } else if (!strcmp("sync_interval", key)) {
-      cfg_sync_interval = (unsigned int)atol(value);
     } else if (!strcmp("zone_id", key)) {
       cfg_zones_len += 1;
       if (cfg_zones != NULL) {
@@ -391,6 +396,14 @@ static int parse_config(void) {
     }
   }
   fclose(config);
+  if (cfg_cf_token == NULL)
+    printf("'cf_token' was not specified but it is required.\n");
+  if (cfg_zones_len < 1 || cfg_zones[0].len < 1)
+    printf("Config file must specify at least one DNS zone and record to update.\n");
+  if (cfg_cf_token == NULL || cfg_zones_len < 1 || cfg_zones[0].len < 1) {
+    printf("\n");
+    return -1;
+  }
   return 0;
 }
 
@@ -401,7 +414,8 @@ static void init(void) {
 
   ret = parse_config();
   if (ret < 0) {
-    syslog(LOG_ERR, "Could not parse config file: %s.", strerror(ret));
+    print_config_file_help();
+    log_debug("Could not parse config file: %s.", strerror(ret));
     deinit();
     exit(1);
   }
@@ -411,7 +425,7 @@ static void init(void) {
     struct passwd *nobody = getpwnam("nobody");
     if (nobody == NULL || setgid(nobody->pw_gid) < 0 ||
         setuid(nobody->pw_uid) < 0) {
-      syslog(LOG_ERR, "Unable to set user to nobody.");
+      log_debug("Unable to set user to nobody.");
       deinit();
       exit(1);
     }
